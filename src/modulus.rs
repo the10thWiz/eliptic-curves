@@ -285,7 +285,7 @@ impl<C: ElipticCurve> Neg for &CurvePoint<C> {
 }
 
 #[macro_export]
-macro_rules! weienerstrass_curve {
+macro_rules! weierstrass_curve {
     ($v:vis $name:ident { a: $a:literal, b: $b:literal, mod: $m:literal }) => {
         $crate::prime_mod!(INNER => $m);
         weienerstrass_curve!($v $name { a: $a, b: $b, mod: INNER });
