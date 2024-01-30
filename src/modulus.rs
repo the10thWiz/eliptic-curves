@@ -7,7 +7,7 @@
 use std::{
     cmp::Ordering,
     marker::PhantomData,
-    ops::Neg,
+    ops::{Add, Div, Mul, Sub, Neg, AddAssign, SubAssign, MulAssign, DivAssign},
     str::FromStr,
 };
 
@@ -154,13 +154,29 @@ macro_rules! impl_op {
             }
         }
     };
+    ($c:ident, $b:ident, $op:ident, $fn:ident, $i:tt) => {
+        impl<M: $b> $op<$c<M>> for $c<M> {
+            fn $fn(&mut self, rhs: $c<M>) {
+                *self = &*self $i rhs;
+            }
+        }
+        impl<M: $b> $op<&$c<M>> for $c<M> {
+            fn $fn(&mut self, rhs: &$c<M>) {
+                *self = &*self $i rhs;
+            }
+        }
+    };
 }
 
-use std::ops::{Add, Div, Mul, Sub};
 impl_op!(ModN, Add, add, M, lhs, rhs => (&lhs.0 + &rhs.0) % M::get_modulus());
 impl_op!(ModN, Sub, sub, M, lhs, rhs => (&lhs.0 + &(-rhs).0) % M::get_modulus());
 impl_op!(ModN, Mul, mul, M, lhs, rhs => (&lhs.0 * &rhs.0) % M::get_modulus());
 impl_op!(ModN, Div, div, M, lhs, rhs => (&lhs.0 * rhs.clone().mul_inverse().0) % M::get_modulus());
+
+impl_op!(ModN, PrimeMod, AddAssign, add_assign, +);
+impl_op!(ModN, PrimeMod, SubAssign, sub_assign, -);
+impl_op!(ModN, PrimeMod, MulAssign, mul_assign, *);
+impl_op!(ModN, PrimeMod, DivAssign, div_assign, /);
 
 impl<M: PrimeMod> std::ops::Neg for ModN<M> {
     type Output = Self;
@@ -183,8 +199,8 @@ pub trait ElipticCurve: Sized {
 }
 
 pub enum CurvePoint<E: ElipticCurve> {
-    Pt(ModN<E::M>, ModN<E::M>, PhantomData<E>),
-    Inf(PhantomData<E>),
+    Pt(ModN<E::M>, ModN<E::M>),
+    Inf,
 }
 
 #[derive(Debug)]
@@ -194,7 +210,7 @@ pub enum CurveError {
 
 impl<E: ElipticCurve> CurvePoint<E> {
     pub fn new(x: BigUint, y: BigUint) -> Result<Self, CurveError> {
-        let ret = Self::Pt(ModN::new(x), ModN::new(y), PhantomData);
+        let ret = Self::Pt(ModN::new(x), ModN::new(y));
         if E::on_curve(&ret) {
             Ok(ret)
         } else {
@@ -203,47 +219,58 @@ impl<E: ElipticCurve> CurvePoint<E> {
     }
 
     pub fn new_zero() -> Self {
-        Self::Inf(PhantomData)
+        Self::Inf
     }
 
     pub unsafe fn new_unchecked(x: ModN<E::M>, y: ModN<E::M>) -> Self {
-        Self::Pt(x, y, PhantomData)
+        Self::Pt(x, y)
     }
 
     pub fn x(&self) -> Option<&ModN<E::M>> {
         match self {
-            Self::Pt(x, _y, _) => Some(x),
-            Self::Inf(_) => None,
+            Self::Pt(x, _y) => Some(x),
+            Self::Inf => None,
         }
     }
 
     pub fn y(&self) -> Option<&ModN<E::M>> {
         match self {
-            Self::Pt(_x, y, _) => Some(y),
-            Self::Inf(_) => None,
+            Self::Pt(_x, y) => Some(y),
+            Self::Inf => None,
         }
     }
 
     pub fn coords(&self) -> Option<(&ModN<E::M>, &ModN<E::M>)> {
         match self {
-            Self::Pt(x, y, _) => Some((x, y)),
-            Self::Inf(_) => None,
+            Self::Pt(x, y) => Some((x, y)),
+            Self::Inf => None,
         }
+    }
+
+    pub fn double(&mut self) {
+        *self = E::add_pts(self, self);
     }
 }
 
 impl_op!(CPt, Add, add, C, lhs, rhs => C::add_pts(&lhs, &rhs));
+impl_op!(CPt, Sub, sub, C, lhs, rhs => C::add_pts(&lhs, &(-rhs)));
+impl_op!(CurvePoint, ElipticCurve, AddAssign, add_assign, +);
+impl_op!(CurvePoint, ElipticCurve, MulAssign, mul_assign, +);
+
 macro_rules! for_each {
     ($($t:ty $(,)?)*) => {
         $(
             impl<C: ElipticCurve> Mul<$t> for CurvePoint<C> {
                 type Output = CurvePoint<C>;
-                fn mul(self, mut rhs: $t) -> Self::Output {
+                fn mul(mut self, mut rhs: $t) -> Self::Output {
                     rhs -= <$t>::from(1u8);
                     let mut ret = self.clone();
-                    while rhs > <$t>::from(0u8) {
-                        ret = ret + &self;
-                        rhs -= <$t>::from(1u8);
+                    while &rhs > &<$t>::from(0u8) {
+                        if &rhs % <$t>::from(2u8) == <$t>::from(1u8) {
+                            ret = ret + &self;
+                        }
+                        self = &self + &self;
+                        rhs /= <$t>::from(2u8);
                     }
                     ret
                 }
@@ -251,11 +278,15 @@ macro_rules! for_each {
             impl<C: ElipticCurve> Mul<$t> for &CurvePoint<C> {
                 type Output = CurvePoint<C>;
                 fn mul(self, mut rhs: $t) -> Self::Output {
+                    let mut s = self.clone();
                     rhs -= <$t>::from(1u8);
                     let mut ret = self.clone();
-                    while rhs > <$t>::from(0u8) {
-                        ret = ret + self;
-                        rhs -= <$t>::from(1u8);
+                    while &rhs > &<$t>::from(0u8) {
+                        if &rhs % <$t>::from(2u8) == <$t>::from(1u8) {
+                            ret = ret + &s;
+                        }
+                        s = &s + &s;
+                        rhs /= <$t>::from(2u8);
                     }
                     ret
                 }
@@ -269,8 +300,8 @@ impl<C: ElipticCurve> Neg for CurvePoint<C> {
     type Output = CurvePoint<C>;
     fn neg(self) -> Self::Output {
         match self {
-            Self::Inf(_) => Self::Inf(PhantomData),
-            Self::Pt(x, y, _) => Self::Pt(x, -y, PhantomData),
+            Self::Inf => Self::Inf,
+            Self::Pt(x, y) => Self::Pt(x, -y),
         }
     }
 }
@@ -278,8 +309,8 @@ impl<C: ElipticCurve> Neg for &CurvePoint<C> {
     type Output = CurvePoint<C>;
     fn neg(self) -> Self::Output {
         match self {
-            CurvePoint::Inf(_) => CurvePoint::Inf(PhantomData),
-            CurvePoint::Pt(x, y, _) => CurvePoint::Pt(x.clone(), -y, PhantomData),
+            CurvePoint::Inf => CurvePoint::Inf,
+            CurvePoint::Pt(x, y) => CurvePoint::Pt(x.clone(), -y),
         }
     }
 }
@@ -288,7 +319,7 @@ impl<C: ElipticCurve> Neg for &CurvePoint<C> {
 macro_rules! weierstrass_curve {
     ($v:vis $name:ident { a: $a:literal, b: $b:literal, mod: $m:literal }) => {
         $crate::prime_mod!(INNER => $m);
-        weienerstrass_curve!($v $name { a: $a, b: $b, mod: INNER });
+        weierstrass_curve!($v $name { a: $a, b: $b, mod: INNER });
     };
     ($v:vis $name:ident { a: $a:literal, b: $b:literal, mod: $m:ty }) => {
         $v struct $name;
@@ -361,8 +392,6 @@ macro_rules! weierstrass_curve {
     };
 }
 
-//weienerstrass_curve!(pub TestCurve<N_101> => "0", "1");
-
 mod derives {
     use super::*;
     use std::fmt::{Display, Debug};
@@ -405,16 +434,16 @@ mod derives {
     impl<E: ElipticCurve> Debug for CurvePoint<E> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::Pt(x, y, _) => write!(f, "({:?}, {:?})", x, y),
-                Self::Inf(_) => write!(f, "(inf)"),
+                Self::Pt(x, y) => write!(f, "({:?}, {:?})", x, y),
+                Self::Inf => write!(f, "(inf)"),
             }
         }
     }
     impl<E: ElipticCurve> Display for CurvePoint<E> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::Pt(x, y, _) => write!(f, "({:?}, {:?})", x, y),
-                Self::Inf(_) => write!(f, "(inf)"),
+                Self::Pt(x, y) => write!(f, "({:?}, {:?})", x, y),
+                Self::Inf => write!(f, "(inf)"),
             }
         }
     }
@@ -422,8 +451,8 @@ mod derives {
     impl<E: ElipticCurve> Clone for CurvePoint<E> {
         fn clone(&self) -> Self {
             match self {
-                Self::Pt(x, y, _) => Self::Pt(x.clone(), y.clone(), PhantomData),
-                Self::Inf(_) => Self::Inf(PhantomData),
+                Self::Pt(x, y) => Self::Pt(x.clone(), y.clone()),
+                Self::Inf => Self::Inf,
             }
         }
     }
@@ -431,8 +460,8 @@ mod derives {
     impl<E: ElipticCurve> PartialEq for CurvePoint<E> {
         fn eq(&self, rhs: &Self) -> bool {
             match (self, rhs) {
-                (Self::Inf(_), Self::Inf(_)) => true,
-                (Self::Pt(lx, ly, _), Self::Pt(rx, ry, _)) => lx == rx && ly == ry,
+                (Self::Inf, Self::Inf) => true,
+                (Self::Pt(lx, ly), Self::Pt(rx, ry)) => lx == rx && ly == ry,
                 _ => false,
             }
         }

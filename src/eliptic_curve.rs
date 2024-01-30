@@ -4,149 +4,331 @@
 // Distributed under terms of the MIT license.
 //
 
-use std::{str::FromStr, fmt::Debug};
+use std::{fmt::Debug, str::FromStr};
 
 use lazy_static::lazy_static;
 use num_bigint::{BigInt, BigUint};
 
-use super::modulus::{ModN, PrimeMod, N_101};
+use crate::modulus::{ModN, PrimeMod, N_101};
 
-lazy_static! {
-    pub static ref CURVE_25519: ElipticCurve = ElipticCurve {
-        base_point: BigUint::from_str("9").unwrap(),
-        prime: BigUint::from_str(
-            "57896044618658097711785492504343953926634992332820282019728792003956564819949"
-        )
-        .unwrap(),
+macro_rules! impl_op {
+    (CPt, $op:ident, $fn:ident, $mod:ident, $lhs:ident, $rhs:ident => $code: expr) => {
+        impl<$mod: MontgomeryCurve> $op<CurvePoint<$mod>> for CurvePoint<$mod> {
+            type Output = CurvePoint<$mod>;
+            fn $fn(self, $rhs: CurvePoint<$mod>) -> Self::Output {
+                let $lhs = self;
+                $code
+            }
+        }
+        impl<$mod: MontgomeryCurve> $op<CurvePoint<$mod>> for &CurvePoint<$mod> {
+            type Output = CurvePoint<$mod>;
+            fn $fn(self, $rhs: CurvePoint<$mod>) -> Self::Output {
+                let $lhs = self;
+                $code
+            }
+        }
+        impl<$mod: MontgomeryCurve> $op<&CurvePoint<$mod>>
+            for &CurvePoint<$mod>
+        {
+            type Output = CurvePoint<$mod>;
+            fn $fn(self, $rhs: &CurvePoint<$mod>) -> Self::Output {
+                let $lhs = self;
+                $code
+            }
+        }
+        impl<$mod: MontgomeryCurve> $op<&CurvePoint<$mod>> for CurvePoint<$mod> {
+            type Output = CurvePoint<$mod>;
+            fn $fn(self, $rhs: &CurvePoint<$mod>) -> Self::Output {
+                let $lhs = self;
+                $code
+            }
+        }
     };
 }
 
-// y^2 = x^3 + ax + b
-// Add points on the curve as our operation
-// - Given points p, q
-// - The line defined by p and q intersects at a third point. We then reflect that point across the
-// x axis to get the third point.
-// - The additive inverse of p is just reflected across the x axis
-// - for p + p we use the tangent at p as the line.
-// - repeated doubling of a point is chaotic
-// - Also has the point at infinity (which we use as zero)
-//
-// For the eliptic curve, we need a curve C, and a generator G
-// private key is k, public key is k * G. We do multiplication as repreated doubling
+pub trait MontgomeryCurve: Sized {
+    type M: PrimeMod;
+    fn on_curve(pt: &CurvePoint<Self>) -> bool;
+    fn add_pts(lhs: &CurvePoint<Self>, rhs: &CurvePoint<Self>) -> CurvePoint<Self>;
+}
 
-pub enum Point<M: PrimeMod> {
-    Pt(ModN<M>, ModN<M>),
+pub enum CurvePoint<C: MontgomeryCurve> {
+    Pt(ModN<C::M>),
     Inf,
 }
 
-impl<M: PrimeMod> Debug for Point<M> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<C: MontgomeryCurve> CurvePoint<C> {
+    pub fn new(num: impl Into<BigUint>) -> Self {
+        Self::Pt(ModN::new(num))
+    }
+
+    #[doc(hidden)]
+    pub fn new_mod(num: ModN<C::M>) -> Self {
+        Self::Pt(num)
+    }
+
+    pub fn inf() -> Self {
+        Self::Inf
+    }
+
+    pub fn x(&self) -> Option<&ModN<C::M>> {
         match self {
-            Self::Pt(x, y) => write!(f, "({:?}, {:?})", x, y),
-            Self::Inf => write!(f, "(inf)"),
-        }
-    }
-}
-
-impl<M: PrimeMod> Clone for Point<M> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Pt(x, y) => Self::Pt(x.clone(), y.clone()),
-            Self::Inf => Self::Inf,
-        }
-    }
-}
-
-pub struct WeienerstrassCurve<M: PrimeMod> {
-    a: ModN<M>,
-    b: ModN<M>,
-}
-
-impl<M: PrimeMod> WeienerstrassCurve<M> {
-    pub fn add(&self, p: &Point<M>, q: &Point<M>) -> Point<M> {
-        match (p, q) {
-            (Point::Pt(px, py), Point::Pt(qx, qy)) => {
-                if px == qx {
-                    if py == qy && py != &ModN::new(0u64) {
-                        let s = (ModN::new(3u64) * px.clone().pow(2u64.into()) + self.a.clone())
-                            / (ModN::new(2u64) * py);
-                        let rx = s.clone().pow(2u64.into()) - px - qx;
-                        let ry = s * (&rx - px) + py;
-                        Point::Pt(rx, -ry)
-                    } else {
-                        Point::Inf
-                    }
-                } else {
-                    let s = (qy - py) / (qx - px);
-                    let rx = s.clone().pow(2u64.into()) - px - qx;
-                    let ry = s * (&rx - px) + py;
-                    Point::Pt(rx, -ry)
-                }
-            }
-            (Point::Inf, q) | (q, Point::Inf) => q.clone(),
+            Self::Pt(x) => Some(x),
+            Self::Inf => None,
         }
     }
 
-    /// Shortcut for add(p, p). Note that this is marginally faster, since it shortcuts the initial
-    /// testing.
-    pub fn double(&self, p: &Point<M>) -> Point<M> {
-        match p {
-            Point::Inf => Point::Inf,
-            Point::Pt(px, py) => {
-                if py == &ModN::new(0u64) {
-                    Point::Inf
-                } else {
-                    let s = (ModN::new(3u64) * px.clone().pow(2u64.into()) + self.a.clone())
-                        / (ModN::new(2u64) * py);
-                    let rx = s.clone().pow(2u64.into()) - px - px;
-                    let ry = s * (&rx - px) + py;
-                    Point::Pt(rx, -ry)
-                }
+    pub fn montgomery_ladder(self, rhs: BigUint) -> Self {
+        let mut r0 = self;
+        let mut r1 = &r0 + &r0;
+        // Most sig bit MUST be one, three least should be zero
+        for i in (rhs.bits() - 1)..=0 {
+            if rhs.bit(i) {
+                r1 = &r0 + &r1;
+                r0 = &r0 + &r0;
+            } else {
+                r0 = &r0 + &r1;
+                r1 = &r1 + &r1;
             }
         }
-    }
-
-    pub fn mul(&self, p: &Point<M>, mut n: BigUint) -> Point<M> {
-        let mut q = p.clone();
-        while n > 0u64.into() {
-            q = self.add(&p, &q);
-            n -= 1u64;
-        }
-        q
+        r0
     }
 }
 
 #[test]
-fn weienerstrass() {
-    let curve = WeienerstrassCurve {
-        a: ModN::<N_101>::new(0u64),
-        b: ModN::new(1u64),
+fn test_bits() {
+    let t = BigUint::from(0b01101u8);
+    assert_eq!(t.bits(), 4);
+    assert_eq!(t.bit(3), true);
+    assert_eq!(t.bit(2), true);
+    assert_eq!(t.bit(1), false);
+    assert_eq!(t.bit(0), true);
+}
+
+use std::ops::{Add, Mul, Neg};
+
+impl_op!(CPt, Add, add, C, lhs, rhs => C::add_pts(&lhs, &rhs));
+macro_rules! for_each {
+    ($($t:ty $(,)?)*) => {
+        $(
+            impl<C: MontgomeryCurve> Mul<$t> for CurvePoint<C> {
+                type Output = CurvePoint<C>;
+                fn mul(self, mut rhs: $t) -> Self::Output {
+                    rhs -= <$t>::from(1u8);
+                    let mut ret = self.clone();
+                    while rhs > <$t>::from(0u8) {
+                        ret = ret + &self;
+                        rhs -= <$t>::from(1u8);
+                    }
+                    ret
+                }
+            }
+            impl<C: MontgomeryCurve> Mul<$t> for &CurvePoint<C> {
+                type Output = CurvePoint<C>;
+                fn mul(self, mut rhs: $t) -> Self::Output {
+                    rhs -= <$t>::from(1u8);
+                    let mut ret = self.clone();
+                    while rhs > <$t>::from(0u8) {
+                        ret = ret + self;
+                        rhs -= <$t>::from(1u8);
+                    }
+                    ret
+                }
+            }
+        )*
     };
-    let p = Point::Pt(ModN::new(38u64), ModN::new(38u64));
-    let mut q = p.clone();
-    for _ in 0..100 {
-        print!("{:?} + {:?}", q, p);
-        q = curve.add(&p, &q);
-        println!(" = {:?}", q);
+}
+for_each!(u8, u16, u32, u64);
+
+impl<C: MontgomeryCurve> Neg for CurvePoint<C> {
+    type Output = CurvePoint<C>;
+    fn neg(self) -> Self::Output {
+        match self {
+            Self::Inf => Self::Inf,
+            Self::Pt(x) => Self::Pt(x),
+        }
+    }
+}
+impl<C: MontgomeryCurve> Neg for &CurvePoint<C> {
+    type Output = CurvePoint<C>;
+    fn neg(self) -> Self::Output {
+        match self {
+            CurvePoint::Inf => CurvePoint::Inf,
+            CurvePoint::Pt(x) => CurvePoint::Pt(x.clone()),
+        }
     }
 }
 
-/// (p, a, b, G, n, h)
-pub struct ElipticCurve {
-    /// G
-    base_point: BigUint,
-    /// p
-    prime: BigUint,
-    // a, b, n, h?
+#[macro_export]
+macro_rules! montgomery_curve {
+    ($v:vis $name:ident { a: $a:literal, base: $b: literal, mod: $m:literal }) => {
+        $crate::prime_mod!(INNER => $m);
+        montgomery_curve!($v $name { a: $a, base: $b, mod: INNER });
+    };
+    ($v:vis $name:ident { a: $a:literal, base: $b:literal, mod: $m:ty }) => {
+        $v struct $name;
+        impl $name {
+            fn get_a() -> &'static $crate::modulus::ModN<$m> {
+                use std::str::FromStr;
+                lazy_static::lazy_static! {
+                    pub static ref A: $crate::modulus::ModN<$m> =
+                        $crate::modulus::ModN::new(
+                            $crate::modulus::BigUint::from_str(concat!($a)).unwrap()
+                        );
+                }
+                &*A
+            }
+
+            fn get_base() -> &'static $crate::eliptic_curve::CurvePoint<Self> {
+                use std::str::FromStr;
+                lazy_static::lazy_static! {
+                    pub static ref A: $crate::eliptic_curve::CurvePoint<$name> =
+                        $crate::eliptic_curve::CurvePoint::new(
+                                $crate::modulus::BigUint::from_str(concat!($a)).unwrap()
+                        );
+                }
+                &*A
+            }
+        }
+
+        impl $crate::eliptic_curve::MontgomeryCurve for $name {
+            type M = $m;
+            fn on_curve(pt: &$crate::eliptic_curve::CurvePoint<Self>) -> bool {
+                todo!()
+            }
+
+            fn add_pts(
+                p: &$crate::eliptic_curve::CurvePoint<Self>,
+                q: &$crate::eliptic_curve::CurvePoint<Self>
+            ) -> $crate::eliptic_curve::CurvePoint<Self> {
+                use $crate::eliptic_curve::CurvePoint;
+                use $crate::modulus::ModN;
+                match (p.x(), q.x()) {
+                    (None, None) => CurvePoint::inf(),
+                    (Some(x), None) | (None, Some(x)) => CurvePoint::new_mod(x.clone()),
+                    (Some(mx), Some(nx)) => {
+                        if mx == nx {
+                            let x = (mx*mx - ModN::new(1u8)).pow(2u8.into());
+                            let z = ModN::new(4u8) * mx * mx * (mx*mx + Self::get_a() * mx + ModN::new(1u8)).pow(2u8.into());
+                            CurvePoint::new_mod(x / z)
+                        } else {
+                            let x = (nx * mx - ModN::new(1u8)).pow(2u8.into());
+                            let z = (nx - mx).pow(2u8.into());
+                            //let inv = (mx - nx).mul_inverse();
+                            //let slope = (todo!()) / (mx - nx);
+                            todo!()
+                        }
+                    },
+                }
+            }
+        }
+    };
 }
 
-impl ElipticCurve {
-    fn get_point(k: &BigUint) -> BigUint {
-        todo!()
+#[macro_export]
+macro_rules! montgomery_curve2 {
+    ($v:vis $name:ident { a: $a:literal, base: $b: literal, mod: $m:literal }) => {
+        $crate::prime_mod!(INNER => $m);
+        montgomery_curve2!($v $name { a: $a, base: $b, mod: INNER });
+    };
+    ($v:vis $name:ident { a: $a:literal, base: $b:literal, mod: $m:ty }) => {
+        $v struct $name;
+        impl $name {
+            fn get_a() -> &'static $crate::modulus::ModN<$m> {
+                use std::str::FromStr;
+                lazy_static::lazy_static! {
+                    pub static ref A: $crate::modulus::ModN<$m> =
+                        $crate::modulus::ModN::new(
+                            $crate::modulus::BigUint::from_str(concat!($a)).unwrap()
+                        );
+                }
+                &*A
+            }
+
+            fn get_base() -> &'static $crate::eliptic_curve::CurvePoint<Self> {
+                use std::str::FromStr;
+                lazy_static::lazy_static! {
+                    pub static ref A: $crate::eliptic_curve::CurvePoint<$name> =
+                        $crate::eliptic_curve::CurvePoint::new(
+                                $crate::modulus::BigUint::from_str(concat!($a)).unwrap()
+                        );
+                }
+                &*A
+            }
+        }
+
+        impl $crate::modulus::ElipticCurve for $name {
+            type M = $m;
+            fn on_curve(pt: &$crate::modulus::CurvePoint<Self>) -> bool {
+                todo!()
+            }
+
+            fn add_pts(
+                p: &$crate::modulus::CurvePoint<Self>,
+                q: &$crate::modulus::CurvePoint<Self>
+            ) -> $crate::modulus::CurvePoint<Self> {
+                use $crate::modulus::{CurvePoint, ModN};
+                match (p.coords(), q.coords()) {
+                    (None, None) => CurvePoint::inf(),
+                    (Some((x, z)), None) | (None, Some((x, z))) => unsafe { CurvePoint::new_unchecked(x.clone(), z.clone()) },
+                    (Some((mx, mz)), Some((nx, nz))) => {
+                        if mx == nx && mz == nz {
+                            let x = (mx*mx - mz*mz).pow(2u8.into());
+                            let z = ModN::new(4u8) * mx * mx * mz * (mx*mx + Self::get_a() * mx * mz + mz).pow(2u8.into());
+                            unsafe { CurvePoint::new_unchecked(x, z) }
+                        } else {
+                            let x = (nx * mx - mz * nz).pow(2u8.into());
+                            let z = (mx * nz - nx * mz).pow(2u8.into());
+                            unsafe { CurvePoint::new_unchecked(x, z) }
+                        }
+                    },
+                }
+            }
+        }
+    };
+}
+
+mod derives {
+    use super::*;
+    use std::fmt::{Display, Debug};
+
+    impl<E: MontgomeryCurve> Debug for CurvePoint<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Pt(x) => write!(f, "({:?})", x),
+                Self::Inf => write!(f, "(inf)"),
+            }
+        }
     }
-}
+    impl<E: MontgomeryCurve> Display for CurvePoint<E> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Pt(x) => write!(f, "({:?})", x),
+                Self::Inf => write!(f, "(inf)"),
+            }
+        }
+    }
 
-// Eliptic curves
+    impl<E: MontgomeryCurve> Clone for CurvePoint<E> {
+        fn clone(&self) -> Self {
+            match self {
+                Self::Pt(x) => Self::Pt(x.clone()),
+                Self::Inf => Self::Inf,
+            }
+        }
+    }
+
+    impl<E: MontgomeryCurve> PartialEq for CurvePoint<E> {
+        fn eq(&self, rhs: &Self) -> bool {
+            match (self, rhs) {
+                (Self::Inf, Self::Inf) => true,
+                (Self::Pt(lx), Self::Pt(rx)) => lx == rx,
+                _ => false,
+            }
+        }
+    }
+    impl<E: MontgomeryCurve> Eq for CurvePoint<E> {}
+}
 
 #[cfg(test)]
 mod tests {
